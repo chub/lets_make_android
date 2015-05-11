@@ -1,0 +1,4 @@
+#ui_print("");
+#ui_print("==================================");
+#delete("/any/paths/to/clean.up");
+#ui_print("Clean up old installation");

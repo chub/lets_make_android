@@ -1,0 +1,414 @@
+#!/usr/bin/env python
+#
+# Copyright (C) 2008 The Android Open Source Project
+# Copyright (C) 2014 github.com/chub
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Given a target-files zipfile, produces an OTA package that installs
+all the files that are listed.
+
+Usage:  ota_from_target_files_list [flags] output_ota_package [ file1 [ file2 ... ] ]
+
+  -i (--input_zip) <file>
+      Filename of the target_files ZIP intermediate.  Files to be included
+      in the delta OTA should be relative to the root of this zip.
+
+      Incompatible with --input_dir.
+
+  -d (--input_dir) <directory>
+      Path to the $OUT directory.  Files to be included in the delta OTA
+      should be relative from the specified directory.
+
+      Incompatible with --input_zip.
+
+  -k (--package_key) <key> Key to use to sign the package (default is
+      the value of default_system_dev_certificate from the input
+      target-files's META/misc_info.txt, or
+      "build/target/product/security/testkey" if that value is not
+      specified).
+
+  -w  (--wipe_user_data)
+      Generate an OTA package that will wipe the user data partition
+      when installed.
+
+  -b  (--begin_script)  <file>
+      Insert the contents of file at the beginning of the update script.
+
+  -e  (--extra_script)  <file>
+      Insert the contents of file at the end of the update script.
+
+  -a  (--aslr_mode)  <on|off>
+      Specify whether to turn on ASLR for the package (on by default).
+
+  --backup <boolean>
+      Enable or disable the execution of backuptool.sh.
+      Disabled by default.
+
+"""
+
+import sys
+
+if sys.hexversion < 0x02040000:
+  print >> sys.stderr, "Python 2.4 or newer is required."
+  sys.exit(1)
+
+import copy
+import os
+import tempfile
+import time
+import zipfile
+
+try:
+  from hashlib import sha1 as sha1
+except ImportError:
+  from sha import sha as sha1
+
+try:
+  import common
+  import edify_generator
+except ImportError:
+  print ""
+  print " This script depends on PYTHONPATH=AOSP_ROOT/build/tools/releasetools"
+  print ""
+  print " Hint: call this script again with PYTHONPATH=/Volumes/code/client/build/tools/releasetools"
+  print ""
+  raise
+
+from ota_from_target_files import (
+  GetBuildProp,
+  IsSymlink,
+  LoadSystemFiles,
+  SignOutput,
+  WriteMetadata,
+  WritePolicyConfig,
+  )
+
+OPTIONS = common.OPTIONS
+OPTIONS.input_zip = None
+OPTIONS.input_dir = None
+OPTIONS.package_key = None
+OPTIONS.wipe_user_data = False
+OPTIONS.begin_script = None
+OPTIONS.extra_script = None
+OPTIONS.aslr_mode = True
+OPTIONS.backuptool = False
+
+
+# If empty, every system file will be included.
+# If non-empty, only system files that match will be included.
+OPTIONS.whitelisted_system_files = set()
+# Initialize info_dict.  Stock script merges parameters from target_files package.
+OPTIONS.info_dict = {}
+
+# By default, this is for out/host/linux-x86
+# If running from OSX after a breakfast, consult ANDROID_HOST_OUT.
+if 'ANDROID_HOST_OUT' in os.environ:
+  OPTIONS.search_path = os.environ['ANDROID_HOST_OUT']
+
+def CopyZippedSystemFiles(input_zip=None,
+                          output_zip=None,
+                          substitute=None):
+  """
+  Copies files underneath system/ in the input zip to the output zip.
+
+  Returns a list of symlinks.
+
+  Arguments:
+  - output_zip may be None, in which case the copy is skipped (but the other side
+    effects still happen).
+  - substitute is an optional dict of {output filename: contents} to be output
+    instead of certain input files.
+  """
+
+  symlinks = []
+
+  for info in input_zip.infolist():
+    if info.filename.startswith("SYSTEM/"):
+      basefilename = info.filename[7:]
+
+      # Enforce whitelisted system files when set has filenames
+      if len(OPTIONS.whitelisted_system_files) > 0:
+        # Lowercase SYSTEM/framework/framework.jar
+        lowercase_filename = info.filename.replace("SYSTEM", "system", 1)
+        if lowercase_filename not in OPTIONS.whitelisted_system_files:
+          continue
+      print "Including: system/%s" % basefilename
+
+      if IsSymlink(info):
+        symlinks.append((input_zip.read(info.filename),
+                         "/system/" + basefilename))
+      else:
+        info2 = copy.copy(info)
+        fn = info2.filename = "system/" + basefilename
+        if substitute and fn in substitute and substitute[fn] is None:
+          continue
+        if output_zip is not None:
+          if substitute and fn in substitute:
+            data = substitute[fn]
+          else:
+            data = input_zip.read(info.filename)
+          output_zip.writestr(info2, data)
+
+  symlinks.sort()
+  return symlinks
+
+def CopyLocalSystemFiles(input_dir=None,
+                         output_zip=None,
+                         substitute=None):
+  """
+  Reads from the root of input_dir for system files.
+  Mimics ota_from_target_files.CopySystemFiles otherwise.
+
+  Returns a list of symlinks.
+
+  Arguments:
+  - output_zip may be None, in which case the copy is skipped (but the other side
+    effects still happen).
+  - substitute is an optional dict of {output filename: contents} to be output
+    instead of certain input files.
+  """
+
+  symlinks = []
+
+  # Check for the system directory
+  system_dir = os.path.join(input_dir, 'system')
+  if not os.path.isdir(system_dir):
+    raise Exception("system/ directory not found inside input_dir \"%s\"", input_dir)
+
+  for root, _, files in os.walk(os.path.join(input_dir, 'system')):
+    for filename in files:
+      # Generate full name, e.g.: out/target/product/hammerhead/system/bin/ls
+      fullfilename = os.path.join(root, filename)
+      # Generate root name, e.g.: system/bin/ls
+      rootfilename = fullfilename.replace(input_dir, '')
+      # Remove leading slash if it ends up here
+      rootfilename = rootfilename[1:] if rootfilename.startswith('/') else rootfilename
+      # Generate base name, e.g.: bin/ls
+      basefilename = fullfilename.replace(os.path.join(input_dir, 'system/'), '')
+
+      if len(OPTIONS.whitelisted_system_files) > 0:
+        if rootfilename not in OPTIONS.whitelisted_system_files:
+          continue
+      print "Including: %s" % basefilename
+
+      if os.path.islink(fullfilename):
+        # chub: this section is not well tested
+        link_filename = os.path.join(root, os.readlink(fullfilename))
+        symlinks.append(("/system/" + basefilename,
+                         link_filename))
+      else:
+        fn = rootfilename
+        if substitute and fn in substitute and substitute[fn] is None:
+          continue
+        if output_zip is not None:
+          if substitute and fn in substitute:
+            data = substitute[fn]
+          else:
+            fh = open(fullfilename)
+            data = fh.read()
+            fh.close()
+          output_zip.writestr(fn, data)
+
+  symlinks.sort()
+  return symlinks
+
+def WriteDeltaOTAPackage(input_zip=None,
+                         input_dir=None,
+                         output_zip=None):
+  """
+  Generates an OTA package from input_zip or input_dir.
+
+  Outputs to output_zip, if defined.
+  """
+  script = edify_generator.EdifyGenerator(3, OPTIONS.info_dict)
+
+  if OPTIONS.backuptool:
+    if 'fstab' not in OPTIONS.info_dict:
+      # Manually mount /system and maintain scripts.mounts array so UnmountAll works
+      script.AppendExtra('run_program("/sbin/busybox", "mount", "/system");')
+      script.mounts.add("/system")
+    else:
+      script.Mount("/system")
+
+    script.RunBackup("backup")
+    script.Unmount("/system")
+
+  script.ShowProgress(0.5, 0)
+
+  if OPTIONS.wipe_user_data:
+    script.FormatPartition("/data")
+
+  if 'fstab' not in OPTIONS.info_dict:
+    script.AppendExtra('run_program("/sbin/busybox", "mount", "/system");')
+    script.mounts.add("/system")
+  else:
+    script.Mount("/system")
+
+  if OPTIONS.begin_script is not None:
+    script.AppendExtra(OPTIONS.begin_script)
+
+  script.UnpackPackageDir("system", "/system")
+
+  if input_zip:
+    symlinks = CopyZippedSystemFiles(input_zip=input_zip, output_zip=output_zip)
+  else:
+    symlinks = CopyLocalSystemFiles(input_dir=input_dir, output_zip=output_zip)
+  script.MakeSymlinks(symlinks)
+
+  script.ShowProgress(0.2, 0)
+
+  if OPTIONS.backuptool:
+    script.ShowProgress(0.2, 10)
+    script.RunBackup("restore")
+
+  script.ShowProgress(0.2, 10)
+
+  script.ShowProgress(0.1, 0)
+
+  if OPTIONS.extra_script is not None:
+    script.AppendExtra(OPTIONS.extra_script)
+
+  script.UnmountAll()
+  if input_zip:
+    script.AddToZip(input_zip, output_zip)
+  else:
+    # Try a list of OUT root paths
+    out_root_paths = [
+      input_dir,
+      os.environ.get('OUT', '.'),
+      os.curdir,
+      # ./out/target, from where this file lives
+      os.path.join(os.path.abspath(os.path.dirname(__file__)), 'binaries', 'target'),
+      ]
+
+    updater_dir = None
+    for out_root_path in out_root_paths:
+      # Cycle through all possible paths searching for updater_intermediates
+      for test_path in \
+          'updater', \
+          os.path.join('obj', 'EXECUTABLES', 'updater_intermediates', 'updater'):
+        updater_file = os.path.join(out_root_path, test_path)
+        if os.path.isfile(updater_file):
+          updater_dir = os.path.dirname(updater_file)
+          break
+    script.AddToZip(None, output_zip, input_path=updater_dir)
+
+  metadata = {}
+  WriteMetadata(metadata, output_zip)
+
+def WriteDeltaOTAPackageFromPath(output_zip):
+  pass
+
+def main(argv):
+  def option_handler(o, a):
+    if o in ("-k", "--package_key"):
+      OPTIONS.package_key = a
+    elif o in ("-w", "--wipe_user_data"):
+      OPTIONS.wipe_user_data = True
+    elif o in ("-b", "--begin_script"):
+      OPTIONS.begin_script = a
+    elif o in ("-e", "--extra_script"):
+      OPTIONS.extra_script = a
+    elif o in ("-a", "--aslr_mode"):
+      if a in ("on", "On", "true", "True", "yes", "Yes"):
+        OPTIONS.aslr_mode = True
+      else:
+        OPTIONS.aslr_mode = False
+    elif o in ("--backup"):
+      OPTIONS.backuptool = bool(a.lower() == 'true')
+    elif o in ("-i", "--input_zip"):
+      OPTIONS.input_zip = a
+    elif o in ("-d", "--input_dir"):
+      OPTIONS.input_dir = a
+    else:
+      return False
+    return True
+
+  args = common.ParseOptions(argv, __doc__,
+                             extra_opts="i:d:k:wb:e:a:",
+                             extra_long_opts=["input_zip=",
+                                              "input_dir=",
+                                              "package_key=",
+                                              "wipe_user_data",
+                                              "begin_script=",
+                                              "extra_script=",
+                                              "aslr_mode=",
+                                              "backup="],
+                             extra_option_handler=option_handler)
+
+  misusageA = len(args) < 1
+  misusageB = (OPTIONS.input_zip and OPTIONS.input_dir)
+  misusageC = (OPTIONS.input_zip is None and OPTIONS.input_dir is None)
+  if misusageA or misusageB or misusageC:
+    if misusageA:
+      print "Please specify the output_ota_package."
+    elif misusageB:
+      print "Both --input_zip or --input_dir were specified, but only can be accepted."
+    elif misuasgeC:
+      print "Neither --input_zip nor --input_dir were specified, but at least once is needed."
+    common.Usage(__doc__)
+    sys.exit(1)
+
+  for arg in args[1:]:
+    OPTIONS.whitelisted_system_files.add(arg)
+
+  if OPTIONS.begin_script is not None:
+    OPTIONS.begin_script = open(OPTIONS.begin_script).read()
+
+  if OPTIONS.extra_script is not None:
+    OPTIONS.extra_script = open(OPTIONS.extra_script).read()
+
+  input_zip_handle = None
+  if OPTIONS.input_zip:
+    print "unzipping target target-files from %s..." % OPTIONS.input_zip
+    _, input_zip_handle = common.UnzipTemp(OPTIONS.input_zip)
+
+  if OPTIONS.verbose:
+    print "--- target info ---"
+    common.DumpInfoDict(OPTIONS.info_dict)
+
+  temp_zip_file = tempfile.NamedTemporaryFile()
+  output_zip = zipfile.ZipFile(temp_zip_file, "w",
+                               compression=zipfile.ZIP_DEFLATED)
+
+  if OPTIONS.input_zip:
+    WriteDeltaOTAPackage(input_zip=input_zip_handle, output_zip=output_zip)
+  else:
+    WriteDeltaOTAPackage(input_dir=OPTIONS.input_dir, output_zip=output_zip)
+
+  if OPTIONS.package_key is None:
+    OPTIONS.package_key = OPTIONS.info_dict.get(
+      "default_system_dev_certificate",
+      "build/target/product/security/testkey")
+
+  output_zip.close()
+
+  SignOutput(temp_zip_file.name, args[0])
+  temp_zip_file.close()
+
+  common.Cleanup()
+
+  print "done."
+
+
+if __name__ == '__main__':
+  try:
+    common.CloseInheritedPipes()
+    main(sys.argv[1:])
+  except common.ExternalError, e:
+    print
+    print "   ERROR: %s" % (e,)
+    print
+    sys.exit(1)
