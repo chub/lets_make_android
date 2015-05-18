@@ -125,9 +125,44 @@ class OpenRecoveryScript(ConsoleWrapper):
         print ' Local MD5: %s  %s' % (local_file_md5sum, local_file)
         return remote_file_md5sum.startswith(local_file_md5sum)
 
+    def set_sdcard_permissions(self, path=None, recursive_to_sdcard_root=False):
+        """
+        This method sets sdcard-compatible permissions (media_rw:media_rw) to a path.
+
+        If recursive_to_sdcard_root is True, then paths up to, but not including, /sdcard will also
+        have their permissions set.
+
+        If the path does not begin with /sdcard/, then this method does nothing.
+
+        For the sdcard daemon to function properly, all files under /sdcard must have media_rw:media_rw
+        user and group ownership.  Without this, errors can occur in device mode (DownloadManager not
+        working, Screenshots cannot be captured, etc).
+        """
+        if not path.startswith('/sdcard/'):
+            return
+
+        self.adb.shell('chown media_rw:media_rw ' + path)
+
+        if recursive_to_sdcard_root:
+            # Fix all permissions until we hit /sdcard.
+            path_traversed = os.path.dirname(path)
+            while path_traversed != '/sdcard':
+                self.adb.shell('chown media_rw:media_rw ' + path_traversed)
+
+                # Make sure we are making progress
+                new_dir = os.path.dirname(path_traversed)
+                if new_dir == path_traversed:
+                    break
+                path_traversed = new_dir
+
     def execute(self):
         self.device.reboot_to_recovery()
         self.adb.wait_for_recovery()
+
+        # Create prefix directory
+        if self.zipfiles:
+            self.adb.shell('mkdir -p ' + self.ZIP_PREFIX)
+            self.set_sdcard_permissions(path=self.ZIP_PREFIX, recursive_to_sdcard_root=True)
 
         # Upload the files
         for local_file, remote_file in self.zipfiles:
@@ -138,6 +173,7 @@ class OpenRecoveryScript(ConsoleWrapper):
                 # Sanity check uploaded file
                 if not self.files_match(local_file, remote_file):
                     raise Exception('Uploaded file did not match in MD5: %s to %s' % (local_file, remote_file))
+                self.set_sdcard_permissions(path=remote_file)
 
         # Create script
         self.adb.shell('rm /cache/recovery/openrecoveryscript')
